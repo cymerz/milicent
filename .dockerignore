@@ -1,0 +1,13 @@
+.git
+.gitignore
+.env
+.env.local
+.agents
+AGENTS.md
+node_modules
+dist
+data
+*.log
+*.tsbuildinfo
+README.md
+DESIGN.md
