@@ -44,6 +44,7 @@ import {
   aggregateTickerNews,
   crawlAllPortals,
   extractNewsSentiments,
+  loadStoredNewsSummaries,
   type TickerNewsSummary,
 } from "./media-pulse.ts";
 import { analyzeTickerHybrid, checkLlmConnectivity } from "./thesis-forge.ts";
@@ -212,23 +213,34 @@ export async function runPipeline(
       );
     } else {
       const crawl = await crawlAllPortals((m) => emitPipelineLog("info", m, 3));
-      const poolArticles =
-        crawl.articles.length > 0
-          ? crawl.articles
-          : getRecentNewsArticles(3).map((a) => ({
-            id: a.id,
-            url: a.url,
-            title: a.title,
-            content: a.content ?? "",
-            portal: a.portal,
-            publishedAt: a.publishedAt,
-          }));
+      const storedMap = loadStoredNewsSummaries(2, watchlist);
 
-      totalArticles = poolArticles.length;
-      const extracted = await extractNewsSentiments(poolArticles, watchlist, (m) =>
-        emitPipelineLog("warn", m, 3)
-      );
-      newsMap = aggregateTickerNews(extracted);
+      let articlesToExtract = crawl.articles;
+      if (articlesToExtract.length === 0 && storedMap.size === 0) {
+        articlesToExtract = getRecentNewsArticles(3).map((a) => ({
+          id: a.id,
+          url: a.url,
+          title: a.title,
+          content: a.content ?? "",
+          portal: a.portal,
+          publishedAt: a.publishedAt,
+        }));
+      }
+
+      totalArticles = articlesToExtract.length;
+      const freshExtracted =
+        articlesToExtract.length > 0
+          ? await extractNewsSentiments(articlesToExtract, watchlist, (m, lvl) =>
+              emitPipelineLog(lvl ?? "info", m, 3)
+            )
+          : [];
+      const freshMap = aggregateTickerNews(freshExtracted);
+
+      newsMap = new Map(storedMap);
+      for (const [ticker, summary] of freshMap.entries()) {
+        newsMap.set(ticker, summary);
+      }
+
       setCache(
         `${checkpointKey}:news`,
         { totalArticles, entries: Array.from(newsMap.entries()) },
@@ -236,7 +248,7 @@ export async function runPipeline(
       );
       emitPipelineLog(
         "info",
-        `Ekstraksi berita selesai: ${totalArticles} artikel diproses -> ${newsMap.size} emiten terdeteksi`,
+        `Ekstraksi berita selesai: ${totalArticles} artikel baru diproses -> ${newsMap.size} emiten berkatalis berita aktif`,
         3
       );
     }

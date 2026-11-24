@@ -28,7 +28,6 @@ import { getCache, savePriceBars, setCache, upsertFundamental } from "./persiste
 const WIB_OFFSET_MS = 7 * 60 * 60 * 1000;
 
 export function loadFallbackEnv(): void {
-  if (process.env.OPENAI_API_KEY || process.env.ANTIGRAVITY_API_KEY) return;
   const candidates = [resolve(process.cwd(), ".env"), resolve(process.cwd(), "../.env")];
   for (const filePath of candidates) {
     if (!existsSync(filePath)) continue;
@@ -40,12 +39,17 @@ export function loadFallbackEnv(): void {
         const eqIdx = line.indexOf("=");
         if (eqIdx <= 0) continue;
         const key = line.slice(0, eqIdx).trim();
-        const val = line.slice(eqIdx + 1).trim().replace(/^["']|["']$/g, "");
-        if (key && process.env[key] === undefined) {
+        const rawVal = line.slice(eqIdx + 1).trim();
+        const val =
+          (rawVal.startsWith('"') && rawVal.endsWith('"')) ||
+          (rawVal.startsWith("'") && rawVal.endsWith("'"))
+            ? rawVal.slice(1, -1)
+            : rawVal.replace(/\s+#.*$/, "").trim();
+        if (key && (!process.env[key] || process.env[key]!.trim() === "")) {
           process.env[key] = val;
         }
       }
-      if (process.env.OPENAI_API_KEY || process.env.ANTIGRAVITY_API_KEY) break;
+      break;
     } catch {
       // Ignore unreadable env files
     }

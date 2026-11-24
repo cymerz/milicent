@@ -1,9 +1,9 @@
 /**
  * Thesis Forge:
- * - OpenAI-Compatible Antigravity LLM Client (filter/decision model routing, Zod retry & 429 backoff)
+ * - OpenAI-Compatible LLM Client (filter/decision model routing, Zod retry & 429 backoff)
  * - Hybrid Quant + AI Stock Prompt Builder
  * - Hard Risk Guardrails (SL floor, R:R gate, Contrarian Swing vs Downtrend Avoid, RSI>75, Low-Vol Fakeout, Distribution, Anti-ARA)
- * - Deterministic Quant Fallback when LLM proxy is offline
+ * - Deterministic Quant Fallback when LLM endpoint is offline
  */
 
 import OpenAI from "openai";
@@ -58,30 +58,22 @@ export function resolveModelForRole(
   role: LLMRole = "default",
   env: Record<string, string | undefined> = process.env
 ): string {
-  const base = env.OPENAI_MODEL?.trim() || env.ANTIGRAVITY_MODEL?.trim() || DEFAULT_MODEL;
+  const base = env.OPENAI_MODEL?.trim() || DEFAULT_MODEL;
   if (role === "filter") {
-    return env.OPENAI_FILTER_MODEL?.trim() || env.ANTIGRAVITY_FILTER_MODEL?.trim() || base;
+    return env.OPENAI_FILTER_MODEL?.trim() || base;
   }
   if (role === "decision") {
-    return env.OPENAI_DECISION_MODEL?.trim() || env.ANTIGRAVITY_DECISION_MODEL?.trim() || base;
+    return env.OPENAI_DECISION_MODEL?.trim() || base;
   }
   return base;
 }
 
 export function getLlmBaseUrl(): string {
-  return (
-    process.env.OPENAI_BASE_URL?.trim() ||
-    process.env.ANTIGRAVITY_BASE_URL?.trim() ||
-    "http://127.0.0.1:8045/v1"
-  ).replace(/\/+$/, "");
+  return (process.env.OPENAI_BASE_URL?.trim() || "http://127.0.0.1:8045/v1").replace(/\/+$/, "");
 }
 
 function getApiKey(): string {
-  return (
-    process.env.OPENAI_API_KEY?.trim() ||
-    process.env.ANTIGRAVITY_API_KEY?.trim() ||
-    "dummy-key"
-  );
+  return process.env.OPENAI_API_KEY?.trim() || "dummy-key";
 }
 
 export function extractJsonString(raw: string): string {
@@ -227,88 +219,144 @@ export async function generateJson<T>(
   };
 }
 
-let cachedConnectivity: { key: string; expiresAt: number } | null = null;
-
-export async function checkLlmConnectivity(): Promise<{
+export interface LlmConnectivityStatus {
   ok: boolean;
   hardOffline: boolean;
   baseUrl: string;
   model: string;
   reason?: string;
-}> {
-  const baseUrl = getLlmBaseUrl();
-  const model = resolveModelForRole("decision");
-  const cacheKey = `${baseUrl}|${model}`;
+}
 
-  if (cachedConnectivity && cachedConnectivity.key === cacheKey && Date.now() < cachedConnectivity.expiresAt) {
-    return { ok: true, hardOffline: false, baseUrl, model };
+let cachedConnectivity: (LlmConnectivityStatus & { key: string; checkedAt: number }) | null = null;
+let connectivityInFlight: Promise<LlmConnectivityStatus> | null = null;
+const unsupportedModelsEndpointBases = new Set<string>();
+const CONNECTIVITY_TTL_MS = 5 * 60_000;
+
+export function getInstantLlmStatus(): boolean {
+  const baseUrl = getLlmBaseUrl();
+  const filterModel = resolveModelForRole("filter");
+  const decisionModel = resolveModelForRole("decision");
+  const cacheKey = `${baseUrl}|${filterModel}|${decisionModel}`;
+
+  if (cachedConnectivity && cachedConnectivity.key === cacheKey) {
+    if (Date.now() - cachedConnectivity.checkedAt > CONNECTIVITY_TTL_MS && !connectivityInFlight) {
+      void checkLlmConnectivity();
+    }
+    return cachedConnectivity.ok;
   }
 
-  const client = new OpenAI({
-    apiKey: getApiKey(),
-    baseURL: baseUrl,
-    timeout: 10_000,
-    maxRetries: 0,
-  });
+  if (!connectivityInFlight) {
+    void checkLlmConnectivity();
+  }
 
-  try {
-    await client.models.list();
-    cachedConnectivity = { key: cacheKey, expiresAt: Date.now() + 60_000 };
-    return { ok: true, hardOffline: false, baseUrl, model };
-  } catch (err) {
-    const status = getHttpStatus(err);
-    const detail = extractErrorDetail(err);
+  const rawKey = (process.env.OPENAI_API_KEY || "").trim();
+  return Boolean(
+    (rawKey && rawKey !== "your-api-key" && rawKey !== "dummy-key") ||
+      process.env.OPENAI_BASE_URL?.trim()
+  );
+}
 
-    if (status === 401) {
-      return {
-        ok: false,
-        hardOffline: true,
-        baseUrl,
-        model,
-        reason: "HTTP 401 Unauthorized (cek OPENAI_API_KEY)",
-      };
+export async function checkLlmConnectivity(): Promise<LlmConnectivityStatus> {
+  const baseUrl = getLlmBaseUrl();
+  const filterModel = resolveModelForRole("filter");
+  const model = resolveModelForRole("decision");
+  const cacheKey = `${baseUrl}|${filterModel}|${model}`;
+
+  if (
+    cachedConnectivity &&
+    cachedConnectivity.key === cacheKey &&
+    cachedConnectivity.ok &&
+    Date.now() - cachedConnectivity.checkedAt < CONNECTIVITY_TTL_MS
+  ) {
+    return cachedConnectivity;
+  }
+
+  if (connectivityInFlight) {
+    return connectivityInFlight;
+  }
+
+  const runProbe = async (): Promise<LlmConnectivityStatus> => {
+    const save = (res: LlmConnectivityStatus): LlmConnectivityStatus => {
+      cachedConnectivity = { ...res, key: cacheKey, checkedAt: Date.now() };
+      return res;
+    };
+
+    const client = new OpenAI({
+      apiKey: getApiKey(),
+      baseURL: baseUrl,
+      timeout: 4_000,
+      maxRetries: 0,
+    });
+
+    let modelsDetail = "";
+    if (!unsupportedModelsEndpointBases.has(baseUrl)) {
+      try {
+        await client.models.list();
+        return save({ ok: true, hardOffline: false, baseUrl, model });
+      } catch (err) {
+        const status = getHttpStatus(err);
+        modelsDetail = extractErrorDetail(err);
+
+        if (status === 401) {
+          return save({
+            ok: false,
+            hardOffline: true,
+            baseUrl,
+            model,
+            reason: "HTTP 401 Unauthorized (cek OPENAI_API_KEY)",
+          });
+        }
+        if (isUnreachableError(err)) {
+          return save({ ok: false, hardOffline: true, baseUrl, model, reason: modelsDetail });
+        }
+        unsupportedModelsEndpointBases.add(baseUrl);
+      }
     }
-    if (isUnreachableError(err)) {
-      return { ok: false, hardOffline: true, baseUrl, model, reason: detail };
-    }
 
-    // Fallback: many OpenAI-compatible routers omit/block GET /models or take >3-10s on /models
-    // while POST /chat/completions works normally.
+    // Probe /chat/completions using the fast filter model instead of heavy decision model
     try {
       await client.chat.completions.create(
         {
-          model,
-          max_tokens: 16,
+          model: filterModel,
+          max_tokens: 8,
           temperature: 0,
-          messages: [{ role: "user", content: "ping" }],
+          messages: [{ role: "user", content: "ok" }],
         },
-        { timeout: 12_000 }
+        { timeout: 8_000 }
       );
-      cachedConnectivity = { key: cacheKey, expiresAt: Date.now() + 60_000 };
-      return { ok: true, hardOffline: false, baseUrl, model };
+      return save({ ok: true, hardOffline: false, baseUrl, model });
     } catch (chatErr) {
       const chatStatus = getHttpStatus(chatErr);
       const chatDetail = extractErrorDetail(chatErr);
-      // 429 (rate-limited) or 400 (e.g. reasoning model min-token rule) proves endpoint + auth are online
       if (chatStatus === 429 || chatStatus === 400 || chatStatus === 422) {
-        cachedConnectivity = { key: cacheKey, expiresAt: Date.now() + 60_000 };
-        return { ok: true, hardOffline: false, baseUrl, model };
+        return save({ ok: true, hardOffline: false, baseUrl, model });
       }
       if (chatStatus === 401) {
-        return {
+        return save({
           ok: false,
           hardOffline: true,
           baseUrl,
           model,
           reason: "HTTP 401 Unauthorized (cek OPENAI_API_KEY)",
-        };
+        });
       }
       if (isUnreachableError(chatErr)) {
-        return { ok: false, hardOffline: true, baseUrl, model, reason: chatDetail };
+        return save({ ok: false, hardOffline: true, baseUrl, model, reason: chatDetail });
       }
-      return { ok: false, hardOffline: false, baseUrl, model, reason: chatDetail || detail };
+      return save({
+        ok: false,
+        hardOffline: false,
+        baseUrl,
+        model,
+        reason: chatDetail || modelsDetail,
+      });
     }
-  }
+  };
+
+  connectivityInFlight = runProbe().finally(() => {
+    connectivityInFlight = null;
+  });
+  return connectivityInFlight;
 }
 
 // ============================================================================

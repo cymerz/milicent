@@ -53,7 +53,7 @@ import { buildTechnicalSnapshot, runScreener } from "./quant-radar.ts";
 import { collectLocalNewsForTicker } from "./media-pulse.ts";
 import {
   analyzeTickerHybrid,
-  checkLlmConnectivity,
+  getInstantLlmStatus,
   getLlmBaseUrl,
   resolveModelForRole,
 } from "./thesis-forge.ts";
@@ -700,7 +700,7 @@ async function handleGetSettings(req: Request): Promise<Response> {
   const settings = getStoredSettings();
   const watchlist = getWatchlist();
   const scheduler = getSchedulerStatus();
-  const llm = await checkLlmConnectivity();
+  const llmConfigured = getInstantLlmStatus();
 
   const payload: AppSettings = {
     scheduler: {
@@ -713,7 +713,7 @@ async function handleGetSettings(req: Request): Promise<Response> {
       baseUrl: getLlmBaseUrl(),
       filterModel: resolveModelForRole("filter"),
       decisionModel: resolveModelForRole("decision"),
-      configured: llm.ok,
+      configured: llmConfigured,
     },
     runtime: {
       schedulerRunning: scheduler.running,

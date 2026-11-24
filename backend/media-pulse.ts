@@ -18,7 +18,7 @@ import {
   insertNewsMentions,
   isNewsDuplicate,
 } from "./persistence.ts";
-import { generateJson } from "./thesis-forge.ts";
+import { generateJson, resolveModelForRole } from "./thesis-forge.ts";
 
 // ============================================================================
 // Portal Configurations (14 IDX Portals)
@@ -837,7 +837,7 @@ const ExtractionResponseSchema = z.object({
 export async function extractNewsSentiments(
   articles: CrawledArticle[],
   watchlistTickers: string[] = [],
-  onLog?: (msg: string) => void
+  onLog?: (msg: string, level?: "info" | "warn") => void
 ): Promise<ExtractedTickerSentiment[]> {
   const candidates: Array<{
     article: CrawledArticle;
@@ -853,10 +853,26 @@ export async function extractNewsSentiments(
     }
   }
 
-  if (candidates.length === 0) return [];
+  if (candidates.length === 0) {
+    if (articles.length > 0) {
+      onLog?.(
+        `[MediaPulse] Tidak ada kode emiten spesifik pada ${articles.length} artikel baru`,
+        "info"
+      );
+    }
+    return [];
+  }
 
+  const filterModel = resolveModelForRole("filter");
   const results: ExtractedTickerSentiment[] = [];
   const batchSize = 14;
+  const totalBatches = Math.ceil(candidates.length / batchSize);
+  let aiExtractedCount = 0;
+
+  onLog?.(
+    `[MediaPulse] Mengekstrak sentimen ${candidates.length} mention (${totalBatches} batch) via Filter LLM (${filterModel})...`,
+    "info"
+  );
 
   for (let i = 0; i < candidates.length; i += batchSize) {
     const batch = candidates.slice(i, i + batchSize);
@@ -887,7 +903,8 @@ Respond ONLY as valid JSON: {"items":[{"articleId":1,"ticker":"BBCA","sentiment"
       }
     } else if (i === 0) {
       onLog?.(
-        `[MediaPulse] Filter LLM tidak aktif (${aiRes.error ?? "offline"}) — fallback lexical sentiment`
+        `[MediaPulse] Filter LLM (${filterModel}) gagal (${aiRes.error ?? "offline"}): fallback lexical sentiment`,
+        "warn"
       );
     }
 
@@ -897,6 +914,7 @@ Respond ONLY as valid JSON: {"items":[{"articleId":1,"ticker":"BBCA","sentiment"
     for (const c of batch) {
       const key = `${c.article.id}:${c.ticker}`;
       const aiItem = aiMap.get(key);
+      if (aiItem) aiExtractedCount++;
       const sentiment =
         aiItem?.sentiment ?? scoreLexicalSentiment(`${c.article.title} ${c.snippet}`);
       const confidence = aiItem?.confidence ?? (c.inHeadline ? 7 : 5);
@@ -927,7 +945,42 @@ Respond ONLY as valid JSON: {"items":[{"articleId":1,"ticker":"BBCA","sentiment"
     insertNewsMentions(dbRows);
   }
 
+  onLog?.(
+    `[MediaPulse] Filter LLM (${filterModel}) selesai: ${aiExtractedCount}/${candidates.length} mention diekstrak via AI`,
+    "info"
+  );
+
   return results;
+}
+
+export function loadStoredNewsSummaries(
+  days = 2,
+  watchlistTickers: string[] = []
+): Map<string, TickerNewsSummary> {
+  const articles = getRecentNewsArticles(days);
+  const mentions: ExtractedTickerSentiment[] = [];
+
+  for (const a of articles) {
+    const matches = matchTickersInArticle(a.title, a.content ?? "", watchlistTickers);
+    for (const m of matches.slice(0, 4)) {
+      const storedSent = getMentionSentiment(a.id, m.ticker);
+      if (storedSent === null) continue;
+      mentions.push({
+        articleId: a.id,
+        ticker: m.ticker,
+        sentiment: storedSent,
+        catalyst: m.inHeadline ? a.title.slice(0, 72) : "Berita emiten",
+        confidence: m.inHeadline ? 8 : 6,
+        inHeadline: m.inHeadline,
+        snippet: m.snippet,
+        portal: a.portal,
+        title: a.title,
+        publishedAt: a.publishedAt,
+      });
+    }
+  }
+
+  return aggregateTickerNews(mentions);
 }
 
 export function aggregateTickerNews(

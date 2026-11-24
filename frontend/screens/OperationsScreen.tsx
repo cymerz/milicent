@@ -364,7 +364,12 @@ export function OperationsScreen() {
               >
                 {settings.models.configured ? "LLM + Quant Online" : "Quantitative Fallback"}
               </span>
-              <span className="font-semibold text-ink">{settings.models.decisionModel}</span>
+              <span className="font-semibold text-ink">
+                Decision: {settings.models.decisionModel}
+              </span>
+              <span className="text-[13px] text-ink-secondary">
+                Filter: <span className="font-semibold text-ink">{settings.models.filterModel}</span>
+              </span>
             </div>
             <div className="text-[13px] text-ink-muted truncate">{settings.models.baseUrl}</div>
           </div>
