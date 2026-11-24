@@ -198,9 +198,9 @@ export async function runPipeline(
     const cachedNews = forceRefresh
       ? null
       : getCache<{
-          totalArticles: number;
-          entries: Array<[string, TickerNewsSummary]>;
-        }>(`${checkpointKey}:news`);
+        totalArticles: number;
+        entries: Array<[string, TickerNewsSummary]>;
+      }>(`${checkpointKey}:news`);
 
     if (cachedNews) {
       totalArticles = cachedNews.totalArticles;
@@ -216,13 +216,13 @@ export async function runPipeline(
         crawl.articles.length > 0
           ? crawl.articles
           : getRecentNewsArticles(3).map((a) => ({
-              id: a.id,
-              url: a.url,
-              title: a.title,
-              content: a.content ?? "",
-              portal: a.portal,
-              publishedAt: a.publishedAt,
-            }));
+            id: a.id,
+            url: a.url,
+            title: a.title,
+            content: a.content ?? "",
+            portal: a.portal,
+            publishedAt: a.publishedAt,
+          }));
 
       totalArticles = poolArticles.length;
       const extracted = await extractNewsSentiments(poolArticles, watchlist, (m) =>
@@ -265,10 +265,19 @@ export async function runPipeline(
     // Stage 5: Deep Hybrid Quant + AI Decision + Guardrails
     emitPipelineLog("step", "Menjalankan Hybrid AI + Hard Risk Guardrails pada kandidat", 5);
     const llmStatus = await checkLlmConnectivity();
-    if (!llmStatus.ok) {
+    let llmCircuitOpen = llmStatus.hardOffline;
+    let consecutiveAiNetworkFails = 0;
+
+    if (llmStatus.hardOffline) {
       emitPipelineLog(
         "warn",
-        `LLM offline (${llmStatus.baseUrl}), menjalankan evaluasi cepat via Quant Fallback`,
+        `LLM tidak dapat dijangkau (${llmStatus.baseUrl}: ${llmStatus.reason ?? "offline"}), menjalankan evaluasi via Quant Fallback`,
+        5
+      );
+    } else if (!llmStatus.ok) {
+      emitPipelineLog(
+        "warn",
+        `Pre-flight LLM lambat (${llmStatus.reason ?? "timeout"}), tetap mencoba Hybrid AI (${llmStatus.model}) pada ${candidates.length} kandidat...`,
         5
       );
     } else {
@@ -357,12 +366,12 @@ export async function runPipeline(
             news: newsMap.get(ticker) ?? null,
             activeSignalContext: activeSig
               ? {
-                  entryPrice: activeSig.entryPrice,
-                  stopLoss: activeSig.stopLoss,
-                  targetPrice1: activeSig.targetPrice1,
-                  targetPrice: activeSig.targetPrice,
-                  signalDate: activeSig.signalDate,
-                }
+                entryPrice: activeSig.entryPrice,
+                stopLoss: activeSig.stopLoss,
+                targetPrice1: activeSig.targetPrice1,
+                targetPrice: activeSig.targetPrice,
+                signalDate: activeSig.signalDate,
+              }
               : null,
           },
           {
@@ -370,11 +379,31 @@ export async function runPipeline(
               highScoreRR: settings.recommendation.minRiskRewardHighScore,
               standardScoreRR: settings.recommendation.minRiskRewardStandardScore,
             },
-            skipAi: !llmStatus.ok,
-            timeoutMs: 25_000,
+            skipAi: llmCircuitOpen,
+            timeoutMs: 45_000,
             maxAttempts: 2,
           }
         );
+
+        if (!llmCircuitOpen) {
+          if (analysis.mode === "HYBRID") {
+            consecutiveAiNetworkFails = 0;
+          } else if (analysis.aiError && !analysis.aiError.startsWith("Schema mismatch")) {
+            consecutiveAiNetworkFails++;
+            if (consecutiveAiNetworkFails >= 3) {
+              llmCircuitOpen = true;
+              emitPipelineLog(
+                "warn",
+                `LLM gagal 3x berturut-turut (${analysis.aiError}), beralih ke Quant Fallback untuk sisa kandidat`,
+                5
+              );
+            }
+          }
+        }
+        const modeTag =
+          analysis.mode === "QUANT_FALLBACK" && analysis.aiError
+            ? `QUANT_FALLBACK: ${analysis.aiError.slice(0, 60)}`
+            : analysis.mode;
 
         const minScore =
           tech.trend === "BEARISH"
@@ -412,7 +441,7 @@ export async function runPipeline(
           completedCount++;
           emitPipelineLog(
             "success",
-            `[${completedCount}/${candidates.length}] BUY ${ticker} (${analysis.setupType}) @ Rp ${analysis.entryPrice} | Score ${analysis.overallScore} | R:R ${analysis.riskRewardRatio}x [${analysis.mode}]`,
+            `[${completedCount}/${candidates.length}] BUY ${ticker} (${analysis.setupType}) @ Rp ${analysis.entryPrice} | Score ${analysis.overallScore} | R:R ${analysis.riskRewardRatio}x [${modeTag}]`,
             5
           );
         } else {
@@ -442,7 +471,7 @@ export async function runPipeline(
           completedCount++;
           emitPipelineLog(
             "info",
-            `[${completedCount}/${candidates.length}] ${ticker}: ${analysis.action} (Score ${analysis.overallScore}, ${guardrailReason}) [${analysis.mode}]`,
+            `[${completedCount}/${candidates.length}] ${ticker}: ${analysis.action} (Score ${analysis.overallScore}, ${guardrailReason}) [${modeTag}]`,
             5
           );
         }

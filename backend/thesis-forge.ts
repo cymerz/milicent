@@ -115,14 +115,38 @@ function isRateLimitError(err: unknown): boolean {
   );
 }
 
+function extractErrorDetail(err: unknown): string {
+  const base = err instanceof Error ? err.message : String(err);
+  if (typeof err === "object" && err !== null && "cause" in err) {
+    const cause = (err as { cause?: unknown }).cause;
+    if (cause instanceof Error && cause.message && !base.includes(cause.message)) {
+      return `${base} (${cause.message})`;
+    }
+    if (typeof cause === "object" && cause !== null && "code" in cause) {
+      const code = String((cause as { code?: unknown }).code ?? "");
+      if (code && !base.includes(code)) return `${base} (${code})`;
+    }
+  }
+  return base;
+}
+
+function getHttpStatus(err: unknown): number | null {
+  if (typeof err === "object" && err !== null && "status" in err) {
+    const st = (err as { status?: unknown }).status;
+    if (typeof st === "number") return st;
+  }
+  return null;
+}
+
 function isUnreachableError(err: unknown): boolean {
-  const msg = err instanceof Error ? err.message.toLowerCase() : String(err).toLowerCase();
+  const msg = extractErrorDetail(err).toLowerCase();
   return (
     msg.includes("econnrefused") ||
     msg.includes("enotfound") ||
-    msg.includes("unable to connect") ||
-    msg.includes("connection error") ||
-    msg.includes("fetch failed")
+    msg.includes("ehostunreach") ||
+    msg.includes("enetunreach") ||
+    msg.includes("err_name_not_resolved") ||
+    msg.includes("unable to connect")
   );
 }
 
@@ -179,8 +203,9 @@ export async function generateJson<T>(
         tokensUsed: totalTokens,
       };
     } catch (err) {
-      lastError = err instanceof Error ? err.message : String(err);
-      if (isUnreachableError(err)) {
+      lastError = extractErrorDetail(err);
+      const status = getHttpStatus(err);
+      if (isUnreachableError(err) || status === 401) {
         break;
       }
       if (attempt < maxAttempts) {
@@ -202,25 +227,87 @@ export async function generateJson<T>(
   };
 }
 
+let cachedConnectivity: { key: string; expiresAt: number } | null = null;
+
 export async function checkLlmConnectivity(): Promise<{
   ok: boolean;
+  hardOffline: boolean;
   baseUrl: string;
   model: string;
+  reason?: string;
 }> {
   const baseUrl = getLlmBaseUrl();
   const model = resolveModelForRole("decision");
-  const controller = new AbortController();
-  const timer = setTimeout(() => controller.abort(), 3000);
+  const cacheKey = `${baseUrl}|${model}`;
+
+  if (cachedConnectivity && cachedConnectivity.key === cacheKey && Date.now() < cachedConnectivity.expiresAt) {
+    return { ok: true, hardOffline: false, baseUrl, model };
+  }
+
+  const client = new OpenAI({
+    apiKey: getApiKey(),
+    baseURL: baseUrl,
+    timeout: 10_000,
+    maxRetries: 0,
+  });
+
   try {
-    const res = await fetch(`${baseUrl}/models`, {
-      headers: { Authorization: `Bearer ${getApiKey()}` },
-      signal: controller.signal,
-    });
-    return { ok: res.ok, baseUrl, model };
-  } catch {
-    return { ok: false, baseUrl, model };
-  } finally {
-    clearTimeout(timer);
+    await client.models.list();
+    cachedConnectivity = { key: cacheKey, expiresAt: Date.now() + 60_000 };
+    return { ok: true, hardOffline: false, baseUrl, model };
+  } catch (err) {
+    const status = getHttpStatus(err);
+    const detail = extractErrorDetail(err);
+
+    if (status === 401) {
+      return {
+        ok: false,
+        hardOffline: true,
+        baseUrl,
+        model,
+        reason: "HTTP 401 Unauthorized (cek OPENAI_API_KEY)",
+      };
+    }
+    if (isUnreachableError(err)) {
+      return { ok: false, hardOffline: true, baseUrl, model, reason: detail };
+    }
+
+    // Fallback: many OpenAI-compatible routers omit/block GET /models or take >3-10s on /models
+    // while POST /chat/completions works normally.
+    try {
+      await client.chat.completions.create(
+        {
+          model,
+          max_tokens: 16,
+          temperature: 0,
+          messages: [{ role: "user", content: "ping" }],
+        },
+        { timeout: 12_000 }
+      );
+      cachedConnectivity = { key: cacheKey, expiresAt: Date.now() + 60_000 };
+      return { ok: true, hardOffline: false, baseUrl, model };
+    } catch (chatErr) {
+      const chatStatus = getHttpStatus(chatErr);
+      const chatDetail = extractErrorDetail(chatErr);
+      // 429 (rate-limited) or 400 (e.g. reasoning model min-token rule) proves endpoint + auth are online
+      if (chatStatus === 429 || chatStatus === 400 || chatStatus === 422) {
+        cachedConnectivity = { key: cacheKey, expiresAt: Date.now() + 60_000 };
+        return { ok: true, hardOffline: false, baseUrl, model };
+      }
+      if (chatStatus === 401) {
+        return {
+          ok: false,
+          hardOffline: true,
+          baseUrl,
+          model,
+          reason: "HTTP 401 Unauthorized (cek OPENAI_API_KEY)",
+        };
+      }
+      if (isUnreachableError(chatErr)) {
+        return { ok: false, hardOffline: true, baseUrl, model, reason: chatDetail };
+      }
+      return { ok: false, hardOffline: false, baseUrl, model, reason: chatDetail || detail };
+    }
   }
 }
 
@@ -284,6 +371,7 @@ export interface HybridAnalysisOutput {
   guardrailReason: string | null;
   mode: "HYBRID" | "QUANT_FALLBACK";
   modelUsed: string;
+  aiError?: string | null;
 }
 
 const AiStockResponseSchema = z.object({
@@ -655,6 +743,7 @@ export async function analyzeTickerHybrid(
   const quant = evaluateQuant(input.technical, input.fundamental);
   const thresholds = options.thresholds ?? { highScoreRR: 1.5, standardScoreRR: 2.0 };
 
+  let lastAiError: string | null = null;
   if (!options.skipAi) {
     const prompt = buildStockPrompt(input, quant);
     const aiRes = await generateJson({
@@ -678,10 +767,11 @@ export async function analyzeTickerHybrid(
         aiRes.modelUsed
       );
     }
+    lastAiError = aiRes.error;
   }
 
   const fallbackDecision = buildQuantFallbackDecision(input, quant);
-  return applyHybridGuardrails(
+  const fallbackOutput = applyHybridGuardrails(
     input,
     quant,
     fallbackDecision,
@@ -689,4 +779,8 @@ export async function analyzeTickerHybrid(
     "QUANT_FALLBACK",
     resolveModelForRole("decision")
   );
+  if (lastAiError) {
+    fallbackOutput.aiError = lastAiError;
+  }
+  return fallbackOutput;
 }
